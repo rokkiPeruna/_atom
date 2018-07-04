@@ -1,0 +1,36 @@
+"*":
+  "atom-fuzzy-grep":
+    showFullPath: true
+  "bracket-matcher":
+    highlightMatchingLineNumber: true
+  core:
+    disabledPackages: [
+      "intentions"
+      "linter-python"
+      "linter"
+      "linter-ui-default"
+    ]
+    telemetryConsent: "limited"
+  editor:
+    preferredLineLength: 79
+    scrollPastEnd: true
+    showInvisibles: true
+    softWrap: true
+    softWrapAtPreferredLineLength: true
+    tabType: "soft"
+  "exception-reporting":
+    userId: "69353531-716e-4c84-ad9a-3f6fa28d88c6"
+  minimap: {}
+  "tree-view": {}
+  welcome:
+    showOnStartup: false
+".json.source":
+  editor:
+    showIndentGuide: true
+".python.regexp.source":
+  editor:
+    tabLength: 2
+".python.source":
+  editor:
+    showIndentGuide: true
+    tabLength: 2

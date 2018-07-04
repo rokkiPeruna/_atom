@@ -1,0 +1,7 @@
+Couldn't retain /home/kaarjuh/.atom/recovery/fault_manager-afb488.py. Code: ENOENT. Message: ENOENT: no such file or directory, open '/home/kaarjuh/.atom/recovery/fault_manager-afb488.py'
+Attempting to call a function in a renderer window that has been closed or released.
+Function provided here: worker.js:71:22
+Remote event names: destroyed, crashed
+Attempting to call a function in a renderer window that has been closed or released.
+Function provided here: worker.js:71:22
+Remote event names: destroyed, crashed
