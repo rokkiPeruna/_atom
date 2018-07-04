@@ -32,9 +32,20 @@
   'Adds Python class':
     'prefix': 'templateclass'
     'body': """
+      class $1($2):
+        \"""
+        $3
+        \"""
+        $4
+        pass
+    """
+  'Adds Python function':
+    'prefix': 'templatefuntion'
+    'body': """
       def $1($2):
         \"""
         $3
         \"""
+        $4
         pass
     """
