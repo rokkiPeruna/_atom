@@ -1,4 +1,7 @@
 "*":
+  "animated-page-scroll":
+    scrollDuration: 1
+    scrollRows: 20
   "atom-fuzzy-grep":
     showFullPath: true
   "bracket-matcher":
@@ -15,10 +18,11 @@
   "exception-reporting":
     userId: "69353531-716e-4c84-ad9a-3f6fa28d88c6"
   "keyboard-scroll":
+    animate: false
     animationDuration: 100
     linesToScrollKeydown: 5
     linesToScrollSingle: 5
-    throttle: 10
+    throttle: 0
   minimap:
     redrawDelay: 100
   "tree-view": {}
