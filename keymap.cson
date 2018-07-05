@@ -41,3 +41,8 @@
   '"': 'tree-view:open-selected-entry-in-pane-2'
   '#': 'tree-view:open-selected-entry-in-pane-3'
   '¤': 'tree-view:open-selected-entry-in-pane-4'
+'atom-text-editor':
+  'alt-up': 'keyboard-scroll:scrollUpWithCursor'
+  'alt-down': 'keyboard-scroll:scrollDownWithCursor'
+  'ctrl-alt-up': 'keyboard-scroll:scrollUp'
+  'ctrl-alt-down': 'keyboard-scroll:scrollDown'

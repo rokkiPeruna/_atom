@@ -14,6 +14,11 @@
     tabType: "soft"
   "exception-reporting":
     userId: "69353531-716e-4c84-ad9a-3f6fa28d88c6"
+  "keyboard-scroll":
+    animationDuration: 100
+    linesToScrollKeydown: 5
+    linesToScrollSingle: 5
+    throttle: 10
   minimap:
     redrawDelay: 100
   "tree-view": {}
