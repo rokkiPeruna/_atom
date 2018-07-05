@@ -30,3 +30,14 @@
 # If you are unfamiliar with CSON, you can read more about it in the
 # Atom Flight Manual:
 # http://flight-manual.atom.io/using-atom/sections/basic-customization/#configuring-with-cson
+#
+#OWN CUSTOMS
+'body':
+  'alt-,': 'window:focus-pane-on-left'
+  'alt-.': 'window:focus-pane-on-right'
+'.platform-win32 .tree-view, .platform-linux .tree-view':
+  #Finnish layout!
+  '!': 'tree-view:open-selected-entry-in-pane-1'
+  '"': 'tree-view:open-selected-entry-in-pane-2'
+  '#': 'tree-view:open-selected-entry-in-pane-3'
+  '¤': 'tree-view:open-selected-entry-in-pane-4'

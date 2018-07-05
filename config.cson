@@ -4,12 +4,6 @@
   "bracket-matcher":
     highlightMatchingLineNumber: true
   core:
-    disabledPackages: [
-      "intentions"
-      "linter-python"
-      "linter"
-      "linter-ui-default"
-    ]
     telemetryConsent: "limited"
   editor:
     preferredLineLength: 79
@@ -20,7 +14,8 @@
     tabType: "soft"
   "exception-reporting":
     userId: "69353531-716e-4c84-ad9a-3f6fa28d88c6"
-  minimap: {}
+  minimap:
+    redrawDelay: 100
   "tree-view": {}
   welcome:
     showOnStartup: false
