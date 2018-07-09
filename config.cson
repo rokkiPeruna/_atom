@@ -7,7 +7,7 @@
   "bracket-matcher":
     highlightMatchingLineNumber: true
   core:
-    telemetryConsent: "limited"
+    telemetryConsent: "no"
   editor:
     preferredLineLength: 79
     scrollPastEnd: true
@@ -17,9 +17,10 @@
     tabType: "soft"
   "exception-reporting":
     userId: "69353531-716e-4c84-ad9a-3f6fa28d88c6"
+  "fuzzy-finder": {}
   "keyboard-scroll":
-    animate: false
-    animationDuration: 100
+    animate: true
+    animationDuration: 200
     linesToScrollKeydown: 5
     linesToScrollSingle: 5
     throttle: 0
