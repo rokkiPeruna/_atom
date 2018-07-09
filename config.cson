@@ -20,11 +20,14 @@
   "fuzzy-finder": {}
   "keyboard-scroll":
     animate: true
-    animationDuration: 200
+    animationDuration: 350
     linesToScrollKeydown: 5
     linesToScrollSingle: 5
-    throttle: 0
+    throttle: 10
   minimap:
+    plugins:
+      "highlight-selected": true
+      "highlight-selectedDecorationsZIndex": 0
     redrawDelay: 100
   "tree-view": {}
   welcome:

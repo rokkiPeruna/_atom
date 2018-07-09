@@ -1,0 +1,1393 @@
+#!/usr/bin/python
+# -*- coding: iso-8859-1 -*-
+
+# Copyright 2017 Bittium Wireless.
+#
+# All rights reserved. This software is the confidential and proprietary
+# information of EB. Any use of this software is subject to the conclusion
+# of a respective license agreement with EB. No rights to the software
+# are granted without such license agreement.
+#
+#########################################################################
+
+import sys, os, socket, threading, time, SocketServer,copy,shutil
+import logging, pprint, traceback
+import ast
+
+try:
+  import json
+except ImportError:
+  # support for Python 2.5
+  import simplejson as json
+from py_libs.gen_utils import *
+from py_libs.net_utils import *
+from act_req_srv import *
+
+import os.path
+import jsonschema
+
+
+from dcm_cmd_parse import *
+from cu_services import *
+#from dbgprint import *
+from generate_protocol_files import *
+
+from multiprocessing import Lock, Value
+
+from threading import Lock
+from cu_services import set_cu_logger
+from generate_protocol_files import set_gp_logger
+from run_time_changes import set_rt_logger
+from dcm_paths import *
+from dev_conf_utils import *
+from param_validate import *
+from dcm_compare_cfg import *
+if sys.platform == 'win32':
+  class Daemon(object): pass
+else:
+  from py_libs.daemonizer import *
+
+
+update_lock = Value('b', False)
+mutex = Lock()
+
+#lock update lock. return false if operation failed
+def reserve_update_lock():
+    global update_lock
+    mutex.acquire()
+    if update_lock.value==True:
+        mutex.release()
+        return False
+    update_lock.value=True
+    mutex.release()
+    return True
+
+def free_update_lock():
+    global update_lock
+    mutex.acquire()
+    update_lock.value=False
+    mutex.release()
+    return True
+
+#returns the value of the thread counter
+def get_update_lock_status():
+    global update_lock
+    return update_lock.value
+
+global logger
+logger = None
+logger_ars = None
+
+default_conf = {
+  'srv_addr': '127.0.0.1',
+  'srv_port': 50120,
+}
+
+
+## TODO enable feature when webUI supports this
+dcm_lock_enabled = True #
+
+
+#TODO support for multiple/selectable schemas
+
+#TODO GET: implementation for array retrieval
+global config
+config = None
+global env_cfg
+env_cfg = {
+'Device':{
+  'schemaFile': ROUTING_CONFIGS_PATH+'/TACOM_ParameterSchema.json',
+  'currentConfFile': ROUTING_CONFIGS_PATH+'/currentConfig.json',
+  'backupConfFile': ROUTING_CONFIGS_PATH+'/backupConfig.json',
+  'factoryDefaultFile':ROUTING_CONFIGS_PATH+'/FactoryDefaults.json',
+  'new_conf_fpath':'/var/run/oam/newConf',
+  'srv_sck_path':'/var/run/dev_conf_mgr.sock',
+  'user':'dev_conf_mgr',
+  'dcm_config':'/etc/dcm/dcm_config.json'
+},
+'PC':{
+  'schemaFile': "test/TACOM_ParameterSchema.json",
+  'currentConfFile': "test/simul/device_config/currentConfig.json",
+  'backupConfFile': "test/backupConfig.json",
+  'factoryDefaultFile':'test/FactoryDefaults.json',
+  'srv_sck_path':'test/dev_conf_mgr.sock',
+  'new_conf_fpath':'test/simul/newConf',
+  'user':'nobody',
+  'dcm_config':'dcm_config.json'
+},
+}
+
+default_dcm_config= {
+  "dcm_config": {
+    "config_name":"dcm_config_default",
+    "presets_used":False,
+    "interface_type":"legacy",
+    "dcm_api_endpoint":"",
+    "config_scheme":"stateless"
+   }
+}
+PR_INFO_MAPPING ={
+"PRESET_0":1,
+"PRESET_1":2,
+"PRESET_2":3,
+"PRESET_3":4,
+"PRESET_4":5,
+"PRESET_5":6,
+"PRESET_6":7,
+"PRESET_7":8,
+"PRESET_8":9,
+"PRESET_9":"RMT", # RMT
+"PRESET_ERASE":"ERASE",
+"PRESET_BANK_1":1,
+"PRESET_BANK_2":2,
+"PRESET_BANK_3":3,
+"PRESET_BANK_4":4,
+"PRESET_BANK_5":5,
+"PRESET_BANK_6":6,
+"PRESET_BANK_7":7,
+"PRESET_BANK_8":8,
+"PRESET_BANK_9":9,
+"PRESET_BANK_10":10
+}
+
+import unicodedata
+
+
+currentConfData = None
+
+
+class CfgState():
+  configNotLoaded=0
+  configLoaded=1
+  sysConfigured=2
+
+
+class DevConfManager(ARSBackend):
+  def __init__(self):
+    # write_lock_mutex controls accessing client_with_write_lock, which
+    # is the actual lock that prevents all but one thread to access
+    # device management operations.
+    global default_dcm_config
+    global currentConfData
+    self.write_lock_mutex = threading.Lock()
+    self.client_with_write_lock = None
+    self.configState=CfgState.configNotLoaded
+    self.update_allowed = False
+    self.client_list=[]
+    self.backup_conf = None #used to backup currentConfig during transaction
+    self.commit_done = False
+    cfg = load_dcm_config(config, logger)
+    logger.debug("Current DCM internal cfg:%s"%cfg)
+    self.pub_socket = None #initialised in setup_dcm_publisher()
+    if cfg is not None:
+      self.dcm_conf = cfg
+    else:
+      self.dcm_conf = default_dcm_config
+    #open and parse schema file
+    #self.schemaData = loadSchema(config,logger)
+    currentConfData = loadCurrentConfig(config,logger)
+    if currentConfData!=None:
+      self.configState=CfgState.configLoaded
+      logger.info("DCM: Existing configuration loadeded.")
+      #TODO validate config against schema
+    else:
+      logger.info("No configuration available.")
+  ######
+  def set_active_req_server(self, ars):
+    self.ars = ars
+
+  def client_entry(self, request):
+    pass
+
+
+
+  def client_joined(self, client_ref):
+    pass
+
+  def client_left(self, client_ref):
+    if client_ref == self.client_with_write_lock:
+      self.client_with_write_lock = None
+
+  ######################################################################
+  # M A S T E R   C O N F I G U R A T I O N   H A N D L I N G
+  ######################################################################
+  def handle_load_master_config_file(self,parsed_req):
+    result = None
+    errpath = None
+    file_path = parsed_req.get('path')
+    logger.debug("Loading master configuration:%s"%file_path)
+    self.publish_change(get_cps_event())
+    master_config = load_json_from_file(file_path, logger)
+    nodeId = parsed_req.get('nodeId',None)
+    logger.debug("Node id from load_master_config:{}".format(nodeId))
+    root_path=''
+    if master_config is not None:
+      ret = self.process_master_config(master_config,nodeId)
+      if ret != None:
+        result = ret
+      else:
+        self.store_new_config(master_config)
+        root_path,dummy = master_config.items()[0]
+        root_path +="/"
+    else:
+      result="ERROR:Cannot load configuration file"
+
+    status = 'OK'
+    if result is not None: #failed
+      status = result
+      self.publish_change(get_cpf_event(status))
+    else: #OK, publish completed event
+      self.publish_change(get_cpc_event())
+
+    reply = {'operation':'load_config_file_resp','status':status,'root_path':root_path}
+
+    return reply
+  def process_master_config(self,master_config,nodeId=None):
+    ret = None
+    preset_num = 1
+    bank_num = 1
+    number_of_presets = 0
+    try:
+      for bank in master_config['preset_configuration']['preset_banks']:
+        preset_num = 1
+        for preset in bank['presets']:
+          preset_data = preset['preset_data']
+          logger.debug("preset_num:%s"%preset_num)
+          #logger.debug("Preset data:%s"%preset_data)
+
+          result,errpath = self.validate_and_apply_new_conf(preset_data,preset_num,bank_num,nodeId,True)
+          if result is not None:
+            logging.error("master configuration processing failed!")
+            #break
+          number_of_presets = number_of_presets + 1  ; preset_num = preset_num + 1
+        bank_num = bank_num + 1
+    except Exception,ex:
+       logger.error("Error processing master config:{}".format(ex))
+       ret = "ERROR:master config file processing failure"
+
+    # if previous step failed, do not proceed further
+    if ret != None:
+      return ret
+    # check if configuration activation is needed
+    curr_preset,curr_bank = self.get_current_preset()
+
+    if curr_preset == None:
+      return ret
+    preset_path = self.get_preset_path(curr_preset,curr_bank)
+    logger.debug("process_master_config: Activating preset:{}".format(preset_path))
+    reply = activate_config(preset_path,dcm_get_all_services())
+    if(reply!='OK'):
+        ret = reply
+    return ret
+
+  ######################################################################
+  def store_new_config(self, new_conf, preset_num = None,bank_num=None):
+
+    global currentConfData
+    currentConfFile = config['currentConfFile']
+    backupConfFile = config['backupConfFile']
+
+    '''
+     Not required / needed yet...
+     # save current config as backup
+     with open(backupConfFile,"w") as backup_file:
+      json.dump(currentConfData,backup_file,indent=2)
+      backup_file.close()
+    '''
+    if preset_num is None: #assuming whole master is saved
+      currentConfData = copy.deepcopy(new_conf)
+    else: # only one preset updated in config
+      currentConfData['preset_configuration']['preset_banks'][bank_num-1]['presets'][preset_num-1]['preset_data'] = copy.deepcopy(new_conf)
+
+    with open(currentConfFile,"w") as conf_file:
+      json.dump(currentConfData,conf_file,indent=2)
+      conf_file.close()
+
+
+  ######################################################################
+  def save_current_config(self):
+    global currentConfData
+    currentConfFile = config['currentConfFile']
+    with open(currentConfFile,"w") as conf_file:
+      json.dump(currentConfData,conf_file,indent=2)
+      conf_file.close()
+
+  def update_preset_to_config(self,preset_num,bank_num):
+    global currentConfData
+    if currentConfData['preset_configuration'].has_key('active_preset'):
+      currentConfData['previous_preset'] = currentConfData['preset_configuration']['active_preset']
+    if currentConfData['preset_configuration'].has_key('active_preset_bank'):
+      currentConfData['previous_preset_bank'] = currentConfData['preset_configuration']['active_preset_bank']
+    try:
+      currentConfData['preset_configuration']['active_preset'] = preset_num
+      currentConfData['preset_configuration']['active_preset_bank'] = bank_num
+      self.save_current_config()
+    except Exception as ex:
+      logger.error("Preset update failed!")
+
+  def set_previous_preset(self,preset_num):
+    global currentConfData
+    try:
+      currentConfData['previous_preset'] = preset_num
+      self.save_current_config()
+    except Exception as ex:
+      logger.error("previous preset update failed!")
+
+
+  def get_previous_preset(self):
+    global currentConfData
+    preset_num = None
+    try:
+      preset_num = currentConfData['previous_preset']
+    except Exception as ex:
+      logger.debug("get_previous_preset():previous preset not set.")
+      return None
+    logger.debug("get_previous_preset:{}".format(preset_num))
+    return preset_num
+
+  def get_current_preset(self):
+    global currentConfData
+    preset_num = None
+    preset_bank = 1
+    try:
+      preset_num = currentConfData['preset_configuration']['active_preset']
+      preset_bank = currentConfData['preset_configuration']['active_preset_bank']
+    except Exception as ex:
+      logger.warning("Cannot read preset number from configuration")
+      return None,1
+    if preset_num == 0: #treat zero as Not set
+      preset_num = None
+
+    return preset_num,preset_bank
+
+  def update_configuration(self,new_conf):
+
+    # Check if current config is updated and if presets used
+    if self.dcm_conf['dcm_config']['presets_used'] == True:
+      curr_preset,bank = self.get_current_preset()
+      if curr_preset == None:
+          return "ERROR: preset must be set to update configuration",None
+    result,err_path = self.validate_and_apply_new_conf(new_conf,curr_preset,bank,0) #nodeId zero indicates that we use current id
+    if result is None:
+      self.store_new_config(new_conf,curr_preset,bank)
+    else:
+      logger.error("Apply config failed:%s"%result)
+    return result, err_path
+
+  def get_preset_path(self,preset_num,bank):
+    preset_num = preset_num + (bank-1)*10
+    preset_path = '/preset'+str(preset_num)
+    target_path = ROUTING_CONFIGS_PATH + preset_path
+    return target_path
+
+  def get_current_config_path(self):
+    if self.dcm_conf['dcm_config']['presets_used']:
+      preset,bank = self.get_current_preset()
+      if preset == 0 or preset == None:
+        return None
+      else:
+        return self.get_preset_path(preset,bank)
+    else:
+      return ROUTING_CONFIGS_PATH
+
+  def validate_and_apply_new_conf(self, new_conf, preset_num=None,bank=1,nodeId=None, update_prev=False):
+
+    #result,errpath=validateConf(new_conf,self.schemaData) #disable validation for now TODO schema and ContentTree changes
+    result = None
+    errpath = None
+    if result == None:
+
+      currPreset,currBank = self.get_current_preset()
+      currCfgNodeId = None
+      try:
+        currCfgNodeId = currentConfData['preset_configuration']['preset_banks'][currBank-1]['presets'][currPreset-1]['preset_data']['device_config']['nodeId']
+      except Exception,ex:
+        pass
+      preset_path = ''
+      tmp_path = config['new_conf_fpath']
+      if preset_num != None:
+        preset_path = '/preset'+str(preset_num+(bank-1)*10)
+      target_path = ROUTING_CONFIGS_PATH + preset_path
+      tmp_path = tmp_path + preset_path
+      create_folder(tmp_path)
+      stationId = None
+      if nodeId == None: #get nodeId from cfg if not explicitly set
+        try:
+          nodeId = new_conf['device_config']['nodeId']
+        except:
+          logger.error("Node id not set!")
+          return 'ERROR: node id not set'
+      elif nodeId == 0: #use current node id in this case if available, else use new_conf node id
+        try:
+          nodeId = currentConfData['preset_configuration']['preset_banks'][currBank-1]['presets'][currPreset-1]['preset_data']['device_config']['nodeId']
+        except Exception, ex:
+          pass
+        if new_conf['device_config'].has_key('nodeId'):
+          nodeId = new_conf['device_config']['nodeId']
+        if nodeId == 0:
+         logger.error("Cannot find nodeId from configurations")
+         return "ERROR: nodeId not set"
+      else: #use node Id that is explicitly set, set it to config
+        new_conf['device_config']['nodeId'] = nodeId
+      logger.debug("Using node Id:{}".format(nodeId))
+      # save new config temporarily for processing
+      src_conf_file = tmp_path +'/imported_conf.json'
+      with open(src_conf_file,"w") as newconf_file:
+        json.dump(new_conf,newconf_file, indent=2)
+        newconf_file.close()
+      logger.debug("Generating configuration files...");
+
+
+      #1ST STEP, GENERATE CONFIGURATION
+      ret = generate_routing_files(nodeId,None, src_conf_file, tmp_path,'',False,preset_path)
+
+      if 'ERROR' in ret:
+       logger.error("Error generating new configuration")
+       result="configuration generation error"
+       errpath=""
+       return result,errpath
+
+      #2ND STEP, COPY configuration
+
+      if preset_num != None:
+        logger.debug("Copying Preset config files to preset folder...");
+      else:
+        logger.debug("Copying config files...");
+      ret=copy_config(tmp_path, target_path)
+      if 'ERROR' in ret:
+        logger.error("Error copying configuration")
+        result="configuration generation error"
+        errpath=""
+        return result,errpath
+
+      # if update_prev is True, then new_conf_src is copied to previous_conf_src (master config loading case)
+      if update_prev:
+        try:
+          shutil.copyfile(target_path+'/new_conf_src.json',target_path+'/previous_conf_src.json')
+        except Exception,ex:
+          result='ERROR:cannot copy configuration'
+          errpath=''
+        try:
+          os.unlink(target_path+'/new_conf_src.json')
+        except Exception,ex:
+          logger.warning("cannot remove {}".format(target_path+'/new_conf_src.json') )
+
+
+      #TODO generate_protocol_files is TACWIN legacy stuff, must be separated from generic handling
+      '''
+      #3RD STEP, UPDATE PROTOCOL LIST FILES
+      logger.debug("Generating protocol files...")
+      ret = generate_if_protocol_list_file(nodeId,src_conf_file,target_path+'/target_protocol_list.txt','',2) #TODO check last parameter(nodePriority)
+      if ret != 'OK':
+        logger.error("Error generating protocol list file")
+        result="configuration generation error"
+        errpath=""
+        return result,errpath
+
+      logger.info("Config. applied successfully")
+      '''
+    else:
+      pass #TODO validation error handling
+    return result,errpath
+
+  def change_preset(self,preset_num,bank=1):
+    # activate, test, REMOVE
+     if preset_num == None:
+       return "ERROR:invalid preset number"
+     curr_preset,curr_bank = self.get_current_preset()
+     if curr_preset == preset_num and curr_bank == bank:
+       return "ERROR:preset already active"
+     if preset_num == "RMT":
+       logger.debug("RMT selected, now in RMT mode")
+        #TODO set RMT / webUI control mode
+       return 'OK'
+     if preset_num == "ERASE":
+       logger.debug("ERASE inidicated from OAM, no action in DCM.")
+       return 'OK'
+     preset_path=self.get_preset_path(preset_num,bank)
+     if not os.path.exists(preset_path):
+       return "ERROR:preset does not exist"
+     logger.debug("DCM::change_preset: Changing preset to %s"%preset_path)
+
+
+     #cstart = time.clock()
+     prev_preset,prev_bank = self.get_current_preset()
+     logger.debug("change_preset:prevs:{}".format(prev_preset,prev_bank))
+     curr_preset_file = None
+     if prev_preset != None:
+       curr_preset_file = self.get_preset_path(prev_preset,prev_bank)+"/previous_conf_src.json"
+     new_preset_file = preset_path+"/previous_conf_src.json"
+     logger.debug("prev preset:%s,new preset:%s"%(curr_preset_file,new_preset_file))
+
+     #TODO obtain also detailed changes from dcm_compare_config(available already there), if/when needed by apps
+     changed_services = dcm_compare_configs(curr_preset_file,new_preset_file)
+     logger.debug("Changed services:{}".format(changed_services))
+     ret=activate_config(preset_path,changed_services)
+     result ="OK"
+     if 'ERROR' in ret:
+       logger.error("Error activating configuration")
+       result= ret
+     else:
+       self.update_preset_to_config(preset_num,bank)
+       self.publish_change({"path":"preset_configuration/active_preset/","data":str(preset_num)})
+     #cend = time.clock()
+     #logger.debug("Preset change time:{} s".format((cend-cstart)*1000))
+
+     return result
+
+
+  ###############################################################################
+  # POST request Handling
+  ###############################################################################
+  def handle_post_request(self,data,path):
+    errcode=None
+    org_path = path
+    curr_preset,bank = self.get_current_preset()
+    if curr_preset==None:
+      return org_path,400,"Preset must be set in order to be able to update current config"
+
+    root = path.split('/')[0]
+
+    if root != "device_config":
+      return org_path,400,"Invalid path for udpate operation"
+    path = path.split('/')[1:]
+    errdetails=None
+    logger.debug("handle_post_request!")
+    logger.debug("Path:{}".format(path))
+    logger.debug("Root:{}".format(root))
+    #make a copy of current  config
+    global currentConfData
+
+
+    if currentConfData != None:
+      #NOTE NOTE NOTE: Deep copy can be heavy operation if files are large!!!
+      new_config = copy.deepcopy(currentConfData)
+      preset,bank = self.get_current_preset()
+      #NOTE: Reassigning to just deep copied new config???
+      #Should it be
+      #new_config =  copy.deepcopy(currentConfData['preset_configuration']['preset_banks'][bank-1]['presets'][preset-1]['preset_data'])
+      new_config= new_config['preset_configuration']['preset_banks'][bank-1]['presets'][preset-1]['preset_data']
+    else: #handle empty current config case
+      logger.debug("current config is empty, creating new config")
+      new_config = data
+      result,errpath=self.update_configuration(new_config)
+      if result != None:
+        if errpath!='':
+          errcode=400
+          errdetails="Invalid JSON data in {}".format(errpath)
+        else: #conf generation error, details in result
+          result = 400
+          errdetails = result
+      if org_path =='':
+        org_path = 'device_config/'
+      return org_path,errcode,errdetails
+         ###########################################
+    if new_config.has_key(root):
+      updatepath = new_config[root]
+    else:
+      new_config[root]={}
+    update_error = None
+    listitem = False
+    create_resource = False
+    arraysize=0
+    update_done = False
+    #check for whole tree update cases
+    if len(path)==0: #if full config, empty tree and update whole
+      logger.debug("Full tree update applied")
+      new_config[root] = None
+      new_config.update(data)
+      result,errpath=self.update_configuration(new_config)
+      if result != None:
+        errcode=400
+        errdetails="Invalid JSON data in {}".format(errpath)
+      if org_path =='':
+        org_path = 'device_config/'
+      return org_path,errcode,errdetails
+    ## end check for whole tree update
+
+    #HANDLE PARTIAL UPDATE ###
+    idx=""
+    prevIdx = ""
+    for i in range(len(path)):
+      prevIdx = idx
+      idx = path[i]
+      if i<(len(path)-1):
+        try:
+          updatepath=updatepath[idx]
+        except KeyError as err:
+          if(path[i+1].isnumeric()): #check for array (last in path is /x)
+            prevIdx=idx
+            idx=path[i+1]
+            logger.debug("seems to be array:previdx {},idx {}".format(prevIdx,idx))
+            break
+          else:
+            update_error=True
+            logger.debug("Resource not found!")
+            errcode = 400
+            errdetails="Key Error"
+        except:
+          errcode = 500
+          logger.debug("internal server error in search loop")
+          errdetails = "Internal Server Error"
+          update_error = True
+    logger.debug("after loop:previdx {},idx {}".format(prevIdx,idx))
+    if not update_error:
+      try:
+        temp = updatepath[idx]
+        if isinstance(temp,list):
+          listitem = True
+      except KeyError as err:
+        #update_error=True
+        logger.debug("Requested resource not found. new to be created")
+        #check for array item
+        index=0
+        listitem= False
+        newlistitem = False
+        try: # test if url's last part is number => implies array reference
+          index = int(idx)
+          newlistitem = True
+          logger.debug("ListItem indeed!")
+        except ValueError as valerror:
+          pass
+        if newlistitem == False:
+          # create new dict with node information, e.g. node = gps => {"gps":{ data }}
+          strdata = "{"+'"'+idx+'"'+":["+json.dumps(data)+"]}"
+          logger.debug("new dict:{}".format(strdata))
+          data = ast.literal_eval(strdata)
+        else: #create array entry
+          logger.debug("creating list item!");
+          strdata = "{"+'"'+prevIdx+'"'+":["+json.dumps(data)+"]}"
+          #logger.debug(strdata)
+          data = ast.literal_eval(strdata)
+        logger.debug("new data {}".format(data))
+        create_resource=True
+        #errcode = 400
+        #errdetails="Key Error"
+      except Exception as e:
+        errcode = 500
+        errdetails = "Internal Server Error"
+        logger.debug("internal server error in final node handling")
+        logger.debug(e.args())
+        update_error = True
+    if not update_error:
+          if not listitem:
+            logger.debug("updating %s with:"%updatepath[idx])
+            logger.debug(data)
+            #now update data idx node if it existed, or update with new dict with idx node included(create)
+            if not create_resource:
+              try:
+                updatepath[idx].update(json.loads(data))
+              except (TypeError,AttributeError) as err: #value cannot be updated, assign directly
+                updatepath[idx] = data
+
+            else:
+              updatepath.update(data)
+            logger.debug("updated.:")
+          else:
+            updatepath[idx].append(data)
+            arraysize = len(updatepath[idx])
+
+          result,errpath=self.update_configuration(new_config)
+          if result != None:
+            errcode=400
+            errdetails="Invalid JSON data in {}".format(errpath)
+
+    #TODO what to return, set data or path or...
+    pathidx = -1
+    if listitem== True:
+      pathidx = arraysize-1
+    path = get_location(""+root,path,pathidx)
+    return path,errcode,errdetails
+
+  ######################################################################
+  ############# DELETE HANDLING ########################################
+  ######################################################################
+  def handle_delete_request(self,root,path):
+    errcode=None
+    errcode=None
+    errdetails=None
+    path = path.split("/")
+    logger.debug("handle_delete_request!")
+    logger.debug("Path:{}".format(path))
+    #make a copy of current  config
+    global currentConfData
+    new_config = copy.deepcopy(currentConfData)
+    updatepath = new_config[root]
+    update_error = None
+    listitem = False
+    create_resource = False
+    #check for whole tree update
+    if len(path)==0:
+      logger.debug("Full tree delete applied")
+      res = new_config.pop(root,None)
+      if res == None:
+        logger.debug("Tree {} not found".format(root))
+        errcode = 404
+        errdetails="Resource {} not found".format(root)
+      else:
+        result,errpath=self.update_configuration(new_config)
+        if result != None:
+          errcode=400
+          errdetails="Invalid JSON data in {}".format(errpath)
+
+      return data,errcode,errdetails
+    ## end check for whole tree update
+
+    #HANDLE PARTIAL UPDATE ###
+    idx=""
+    prevIdx = ""
+    for i in range(len(path)):
+      prevIdx = idx
+      idx = path[i]
+      if i<(len(path)-1):
+        try:
+          updatepath=updatepath[idx]
+        except KeyError as err:
+          if(path[i+1].isnumeric()): #check for array (last in path is /x)
+            prevIdx=idx
+            idx=path[i+1]
+            logger.debug("seems to be array:previdx {},idx {}".format(prevIdx,idx))
+            break
+          else:
+            update_error=True
+            logger.debug("Resource not found!")
+            errcode = 400
+            errdetails="Key Error"
+        except:
+          errcode = 500
+          logger.debug("internal server error in search loop")
+          errdetails = "Internal Server Error"
+          update_error = True
+    logger.debug("after loop:previdx {},idx {}".format(prevIdx,idx))
+    logger.debug("update path now {}".format(updatepath))
+    if not update_error:
+      try:
+        temp = updatepath
+        if isinstance(temp,list):
+          listitem = True
+      except KeyError as err:
+        update_error=True
+        errcode = 404
+        errdetails="Invalid resource/path"
+      except Exception as e:
+        errcode = 500
+        errdetails = "Internal Server Error"
+        logger.debug("internal server error in final node handling")
+        logger.debug(e.args())
+        update_error = True
+    if not update_error:
+      if not listitem:
+        logger.debug("Deleting updatepath[{}]".format(idx))
+        try:
+          del updatepath[idx]
+        except Exception as e:
+          logger.debug("dict delete failed:")
+          logger.debug(e.args())
+          errcode=404
+          errdetails="Invalid resource/path"
+          update_error = True
+      else:#todo handle index error...
+        try:
+          updatepath.pop(int(idx))
+        except Exception as e:
+          update_error=True
+          logger.debug("array delete failed:")
+          logger.debug(e.args())
+          errcode=404
+          errdetails="Invalid resource/path"
+
+      if not update_error:
+        result,errpath=self.update_configuration(new_config)
+        if result != None:
+          errcode=400
+          errdetails="Invalid JSON data in {}".format(errpath)
+
+    #TODO what to return, set data or path or...
+    return path,errcode,errdetails
+
+  #############################################################################
+  # common get request handler  #
+  # @param treepath - root of dict where data is searched
+  # @param path -   - search path of data
+  #############################################################################
+  def handle_get_request(self,treepath,path):
+
+      #remove trailing / from path to allow either path or path/ notations
+      if path[len(path)-1] == "/":
+          path = path[:-1]
+
+      path = path.split("/")
+
+      active_preset,bank = self.get_current_preset()
+      if path[0] == 'device_config' and active_preset !=None and self.dcm_conf['dcm_config']['presets_used'] == True:
+        logger.debug("Getting value from current preset..")
+        treepath = currentConfData['preset_configuration']['preset_banks'][bank-1]['presets'][active_preset-1]['preset_data']
+      elif path[0] == 'device_config' and active_preset ==None and self.dcm_conf['dcm_config']['presets_used'] == True:
+        return None,404,"ERROR: Current config tried to read and no preset is set"
+      var = None
+
+      #TODO implement this hack properly
+
+      errcode = None
+      errdetails = None
+      logger.debug("handle_get_request,args:")
+      logger.debug(path)
+      previdx=""
+      idx = ""
+      for i in range(len(path)):
+        previdx=idx
+        idx = path[i]
+        #if isinstance(treepath[idx],dict):
+        try:
+          #logger.debug("idx in loop: {}".format(idx))
+          treepath=treepath[idx]
+        except KeyError as e:
+
+            #logger.debug(str(e))
+            errcode = 404
+            errdetails="Invalid resource/path"
+        except TypeError as te:
+           if idx.isnumeric(): # check for array
+            #logger.debug("ref. seems to be array:{}".format(idx))
+            try:
+              treepath=treepath[int(idx)]
+              #treepath=treepath[int(nidx)]
+              #logger.debug("treepath as array:{}".format(treepath))
+            except IndexError as e:
+              errcode=404;errdetails="Invalid resource/path"
+           else:
+              errcode=404;errdetails="Invalid resource/path"
+
+        #except IndexError, e:
+         # logger.debug(str(e))
+          #errcode = 404
+          #errdetails="Invalid resource/path"
+        except Exception as ue:
+          logger.debug("Exception:type{},args:{}".format(type(ue),ue.args))
+          errcode = 500
+          errdetails="Unknown server error"
+      logger.debug(treepath)
+      #logger.debug(data[arrayref])
+#      if errorcode != None:
+#       treepath=""
+      if(errcode == None):
+        logger.debug("get operation successful");
+        return treepath,errcode,errdetails
+      else:
+        return None,errcode,errdetails
+
+  ##########################################################################
+  # Handle operation execution in /dev/operation tree                      #
+  ##########################################################################
+  def handle_exec_oper(self,args,path):
+    return operations.handleOperation(args,path)
+
+  def find_client_record(self,clientId):
+    if clientId == None:
+      return None
+    for client in self.client_list:
+      if clientId == client['clientId']:
+        return client
+
+    return None
+  def find_client_record_by_addr(self, addr):
+    if addr == None:
+      return None
+    for client in self.client_list:
+      if addr == client['address']:
+        return client
+
+    return None
+
+  ## check if client has required update lock
+  def req_allowed(self,client):
+    status = True
+    global dcm_lock_enabled
+    if dcm_lock_enabled:
+      status = self.client_with_write_lock == client
+      if status == False:
+        logger.warning("Configuration not locked for client:{}, operation not allowed".format(client['clientId']))
+    return status
+
+
+  ## make backup of current (preset) config
+  def do_backup(self):
+    global currentConfData
+    if currentConfData == None:
+      return
+    if self.dcm_conf['dcm_config']['presets_used']: #presets are used, make copy of current preset config (current config is edited)
+      preset_num,bank = self.get_current_preset()
+      if preset_num == 0 or preset_num==None: #no preset set, return
+        return
+      self.backup_conf = copy.deepcopy(currentConfData['preset_configuration']['preset_banks'][bank-1]['presets'][preset_num-1]['preset_data'])
+    else:
+      self.backup_conf = copy.deepcopy(currentConfData)
+
+
+  ## restore backup of current (preset) config if needed
+  def restore_backup_if_needed(self):
+    global currentConfData
+    if self.backup_conf == None:
+      return
+    if self.commit_done == True: #if commit done, no need to revert
+      return
+    if self.dcm_conf['dcm_config']['presets_used']: #presets are used, make copy of current preset config (current config is edited)
+      preset_num,bank = self.get_current_preset()
+      if preset_num == 0 or preset_num == None: #no preset set, return
+        return
+      currentConfData['preset_configuration']['preset_banks'][bank-1]['presets'][preset_num-1]['preset_data'] = copy.deepcopy(self.backup_conf)
+    else:
+      currentConfData= copy.deepcopy(self.backup_conf)
+    self.backup_conf = None
+    self.commit_done = False
+
+  ## make committing of configuration
+  def commit_config(self):
+
+
+    cfgpath = self.get_current_config_path()
+    if cfgpath == None:
+      return "OK"
+    prev = cfgpath+'/previous_conf_src.json'
+    new = cfgpath+'/new_conf_src.json'
+    changed_services = dcm_compare_configs(prev,new)
+    ret = activate_config(cfgpath,changed_services)
+    self.commit_done = True
+    return ret
+
+
+## Client Request handler
+# @param self The object pointer
+# @param client_ref Pointer to act_req_srv instance that delivered the request
+# @param request Request itself. Either in JSON format (new) or legacy confupdater supported format
+#
+#
+  def handle_client_req(self, client_ref, request):
+    logger.debug("handle_client_req,req:%s"%request)
+    try:
+      parsed_req = json.loads(request)
+    except Exception, ex:
+      #Try old confupdater format and handle requests...
+      #TODO this should be done according to the DCM config's interface_type instead of exception
+      ret= self.handle_legacy_interface(client_ref,request)
+      if  ret == "Invalid":
+        logger.warning('Cannot parse client request: %s' % str(request))
+      else:
+        self.ars.send_str_reply_to_client(client_ref,ret) #send reply
+      return
+
+    command = parsed_req.get('operation', None)
+    if command == None:
+      logger.error("Invalid message!")
+      return
+    client = self.find_client_record( parsed_req.get('clientId') )
+    if client == None and command != 'register_client':
+        logger.error("No client entry found for clientId :%s, msg discarded."%parsed_req.get('clientId'))
+        return
+    #####################################################################################################
+    if command == 'register_client':
+      new_client = parse_client_registration_request(parsed_req,logger)
+      if new_client != None:
+        prev_client = self.find_client_record_by_addr(new_client['address'])
+        if prev_client != None and new_client['protocol']!='ZMQ': #care about addresses in only non-zmq case
+          logger.error("Client with addr %s already registered!"%new_client['address'])
+          self.ars.send_dict_to_client(client_ref,{'operation':'register_client_reply','clientId':0,'status':'ERROR:client already registered'},new_client)
+          return
+        else:
+          self.client_list.append(new_client)
+          self.ars.send_dict_to_client(client_ref,{'operation':'register_client_reply','clientId':new_client['clientId'],'status':'OK'},new_client)
+
+    #####################################################################################################
+    elif command == 'unregister_client':
+      clientId = parsed_req.get('clientId')
+      prev_client = self.find_client_record(clientId)
+      if prev_client != None:
+        self.ars.send_dict_to_client(client_ref,{'operation':'unregister_client_reply','status':'OK'},prev_client)
+        self.client_list.remove(prev_client)
+        logger.debug("Client %s unregistered"%client['clientId'])
+
+    ##############################################################################
+    ##### MASTER CONFIGURATION LOADING ###########################################
+    elif command == 'load_config_file':
+      if self.req_allowed(client):
+        self.ars.send_dict_to_client ( client_ref, self.handle_load_master_config_file(parsed_req), client )
+      else:
+        self.ars.send_dict_to_client ( client_ref,{'operation':'load_config_file_resp','status':'ERROR: No write lock aquired,operation not allowed'}, client )
+
+    elif command == 'change_preset':
+      preset_num = parsed_req.get('preset_nr',None)
+      bank_num = parsed_req.get('bank_nr',None)
+      res = self.change_preset(preset_num,bank_num)
+      self.ars.send_dict_to_client(client_ref,{'operation':'change_preset_resp','status':res})
+    ##############################################################################
+    ######### POST REQUEST HANDLING ##############################################
+    elif command == 'post_data':
+      if self.req_allowed(client):
+
+        data=parsed_req.get('data')
+        path=parsed_req.get('path')
+        #global currentConfData
+        #data=currentConfData['device_config']
+        data,errcode,details=self.handle_post_request(data,path)
+        if details == None:
+          details=""
+        else:
+          details=":"+details
+        if errcode == None:
+          errcode = "OK"
+        reply={'operation':'post_data_resp','status':str(errcode)+details,"path":data}
+      else:
+        reply ={'operation':'post_data_resp','status':'ERROR: configuration not locked for updating'}
+      #logger.debug("POST reply:")
+      #logger.debug(reply)
+      self.ars.send_dict_to_client(client_ref,reply,client)
+
+
+
+    # GET operation to device_config tree
+    #TODO exception handling, error codes handing, array items handing
+    ################ GET REQUEST HANDLING #################################
+    elif command == 'get_data':
+      logger.debug("received get data")
+      #args = parsed_req.get('path')
+      #root = parsed_req.get('root')
+      path = parsed_req.get('path')
+
+      #logger.debug("number of args {}".format(len(args)))
+      #logger.debug(args)
+      #find item
+      reply=None
+      global currentConfData
+      if currentConfData==None:
+        reply = {'operation':'get_data_resp','status':'ERROR:404 Configuration not available','data':None}
+        self.ars.send_dict_to_client(client_ref, reply,client)
+        return
+      else:
+        data,errcode,details = self.handle_get_request(currentConfData,path)
+
+      if details == None:
+        details="";
+      else:
+        details = ":"+details
+      if errcode == None:
+        errcode = "OK"
+      reply = {'operation':'get_data_resp','status':str(errcode)+details,'data':data}
+      self.ars.send_dict_to_client(client_ref, reply,client)
+
+    ## write lock handling
+    elif command == 'reserve_write_lock':
+      self.write_lock_mutex.acquire()
+      if self.client_with_write_lock == None:
+        self.client_with_write_lock = client
+        logger.debug("Client {} acquired write lock".format(client['clientId']))
+        self.ars.send_dict_to_client ( client_ref,{'operation':'reserve_write_lock_resp','status':'OK'})
+        self.do_backup()
+      else:
+        self.ars.send_dict_to_client ( client_ref,{'operation':'reserve_write_lock_resp','status':'ERROR:configuration already locked.'})
+      self.write_lock_mutex.release()
+
+    elif command == 'release_write_lock':
+      self.write_lock_mutex.acquire()
+      if client == self.client_with_write_lock:
+        self.client_with_write_lock = None
+        logger.debug("Client {} released write lock".format(client['clientId']))
+        self.restore_backup_if_needed()
+        self.commit_done = False
+        self.ars.send_dict_to_client ( client_ref,{'operation':'release_write_lock_resp','status':'OK'})
+      else:
+        logger.debug("ERROR: Client {} has no write lock".format(client['clientId']))
+        self.ars.send_dict_to_client ( client_ref,{'operation':'release_write_lock_resp','status':'ERROR.configuration not locked by this client'})
+      self.write_lock_mutex.release()
+    elif command == 'commit':
+      if self.req_allowed(client):
+        reply = self.commit_config()
+        self.ars.send_dict_to_client ( client_ref,{'operation':'commit_resp','status':reply})
+      else:
+        self.ars.send_dict_to_client ( client_ref,{'operation':'commit_resp','status':'ERROR: No write lock aquired,operation not allowed'})
+
+    #############################################################################
+    ######## DELETE HANDLING ####################################################
+    elif command == 'delete_data':
+      path = parsed_req.get('dataToDelete')
+      res,errcode,details=self.handle_delete_request('device_config',path)
+      reply={"error":errcode,"details":details,"data":res}
+      self.ars.send_dict_to_client(client_ref,reply)
+    #############################################################################
+    #
+    #    self.send_dict_as_json({'cmd':'exec_oper','args':data,'path':path})
+    elif command == 'exec_oper':
+      args = parsed_req.get('args')
+      path = parsed_req.get('path')
+      data,errcode,details = self.handle_exec_oper(args,path)
+      reply={"error":errcode,"details":details,"data":data}
+      self.ars.send_dict_to_client(client_ref,reply)
+    return
+################################ E-O-F handle_client_req Function ###############################
+
+  def periodic_actions(self):
+    #logger.debug("Configuration Manager periodic actions called.")
+    pass
+  def send_all_clients_json(self, message):
+    pass
+
+## Legacy ConfUpdater interface against legacy webui ####################################################################
+#
+  def handle_legacy_interface(self,client_ref,msg):
+
+    if not msg:
+      return "Invalid"
+
+    params = msg.split(';')
+    ret = 'ERROR'
+    #TODO validate input parameters
+
+    if (params[0]=="GENERATE_ROUTING_FILES") and self.update_allowed:
+      logger.info("GENERATE_ROUTING_FILES")
+      logger.debug("params 1:{}".format(params[1]))
+      logger.debug("params 2:{}".format(params[2]))
+      logger.debug("params 3:{}".format(params[3]))
+      logger.debug("params 4:{}".format(params[4]))
+      logger.debug("params 5:{}".format(params[5]))
+      val_result = validate_routing_params(params)
+      if val_result == None:
+        ret=generate_routing_files(params[1], params[2], params[3], params[4], params[5], False)
+      else:
+        logger.error("message validation failed, discarding message:{}".format(val_result))
+
+    if (params[0]=="GENERATE_IF_PROTOCOL_LIST") and self.update_allowed:
+      logger.info("GENERATE_IF_PROTOCOL_LIST")
+      logger.debug("params 1:{}".format(params[1])) #nodeid
+      logger.debug("params 2:{}".format(params[2])) #port1
+      logger.debug("params 3:{}".format(params[3])) #target
+      logger.debug("params 4:{}".format(params[4])) #port2
+      logger.debug("params 5:{}".format(params[5]))# node_prio
+      val_result = validate_if_protocol_list_params(params)
+      if val_result == None:
+        ret=generate_if_protocol_list_file(params[1], params[2], params[3], params[5],params[4])
+      else:
+        logger.error("message validation failed, discarding message.{}".format(val_result))
+
+
+    if (params[0]=="UPDATE_SEC_KEYS") and self.update_allowed:
+      val_result = validate_sec_key_params(params)
+      if val_result==None:
+        ret=trigger_key_import(params[1])
+      else:
+        logger.error("message validation failed, discarding message.")
+
+    if (params[0]=="UPDATE_ALL") and self.update_allowed:
+     val_result = validate_update_all(params)
+     if val_result == None:
+       ret=update_any('update_all', params[1], params[2])
+     else:
+       logger.error("message validation failed, discarding message.")
+
+    if (params[0]=="GENERATE_CNR_FILES") and self.update_allowed:
+      ret=run_service("cnr")
+
+    if params[0]=="RESERVE_LOCK" and self.update_allowed==False:
+      if reserve_update_lock()==True:
+        ret='OK'
+        self.update_allowed=True
+        logger.info("update lock reserved succesfully")
+      else:
+        ret='ERROR'
+        logger.warning("update lock cannot be reserved [Busy]")
+        self.update_allowed=False
+
+    if params[0]=="FREE_LOCK" and self.update_allowed:
+      if free_update_lock()==True:
+        ret='OK'
+        self.update_allowed=False
+        logger.info("update lock released succesfully")
+      else:
+        ret='ERROR'
+
+    if params[0]=="QUIT":
+      ret='OK'
+
+
+    return ret
+#    try:
+#      self.ars.send_str_reply_to_client(client_ref, ret)
+#    except Exception as e:
+#      logger.debug("Error responding to client: " + str(err))
+#      return "Invalid"
+#    logger.debug(params[0] + " --> ret value: " + ret )
+
+  ####################################################################
+  ## setup DCM change publisher
+  ####################################################################
+  def setup_dcm_publisher(self):
+    self.pub_socket = self.zmq_context.socket(zmq.PUB)
+    pub_addr = self.dcm_conf['dcm_config']['dcm_publisher'][0]
+    pub_port = self.dcm_conf['dcm_config']['dcm_publisher'][1]
+    if pub_addr == "":
+     pub_addr = "*"
+    try:
+      self.pub_socket.bind("tcp://"+pub_addr+":"+str(pub_port))
+    except Exception, ex:
+      logger.error("Cannot bind publisher socket")
+      return False
+    return True
+
+  ####################################################################
+  ## Publish change event
+  ####################################################################
+  def publish_change(self,change):
+    try:
+      self.pub_socket.send_multipart(['dcm/status',json.dumps(change)])
+    except Exception,ex:
+      logger.error("Cannot publish change:{}".format(ex))
+      return False
+    return True
+
+  def check_initial_preset_value(self):
+    logger.debug("DCM:reading initial preset values from OAM")
+    self.ipreset = None
+    self.ibank = None
+    try:
+      sock = self.zmq_context.socket(zmq.REQ)
+      sock.connect(sdr_oam_server)
+    except Exception,ex:
+      logging.error("cannot connect to OAM")
+      return
+    msg = {'operation':'ACTIVE_PRESET_REQ'}
+    try:
+     sock.send_json(msg)
+     reply = sock.recv()
+    except Exception,ex:
+      logger.error("Socket error")
+      return
+    logger.debug("reply got from SDR OAM:{}".format(reply))
+    try:
+      reply= json.loads(reply)
+    except Exception,ex:
+      logger.error("invalid JSON data:{}".format(ex))
+      return
+    finally:
+      sock.close()
+      logger.debug("closing OAM socket.")
+    try:
+      if reply['PRESET']!='PRESET_9' and reply['PRESET']!='PRESET_ERASE':
+        self.ipreset = PR_INFO_MAPPING[reply['PRESET']]
+        self.ibank = PR_INFO_MAPPING[reply['PRESET_BANK']]
+      else:
+        if reply['PRESET']=='PRESET_9':
+          logging.debug("RMT selected by user, preset control via webUI")
+        if reply['PRESET']=='PRESET_ERASE':
+          logging.debug("ERASE selected by user, nothing to be done.")
+        return
+    except Exception,ex:
+      logger.error("Invalid preset configuration:{}".format(reply))
+      return
+    logger.info("DCM:get_initial_preset_value:preset:{},bank:{}".format(self.ipreset,self.ibank))
+    if self.ipreset == 0 or self.ibank==0:
+      return
+    currPreset,currBank = self.get_current_preset()
+    if currPreset != None: # we have already an active configuration
+      if currPreset != self.ipreset or currBank != self.ibank:# let's change preset
+        logger.info("DCM: changing preset according to new initial setting from peripheral mgr")
+        self.change_preset(self.ipreset,self.ibank)
+      else: # trigger wf-mgr config in startup even if nothing has been changed
+        trigger_rt_config(['wf_management'])
+
+
+######################## E O F DevConfMgr Class #######################################
+
+def init_logging(conf):
+    root_logger, log_level = init_root_logger(conf['logging'],
+        conf['log_level'],"ConfMgr")
+    global logger
+    global logger_ars
+    if root_logger == None:
+      logger = VoidLogger()
+      logger_ars = VoidLogger()
+    else:
+      #logger = logging.getLogger('DCM')
+      logger= root_logger
+      #logger.setLevel(log_level)
+      #logger_ars = logging.getLogger('ARS')
+      #logger_ars.setLevel(log_level)
+    logger_ars, log_level = init_root_logger(conf['logging'],
+        conf['log_level'],"CM_ARS")
+     #
+    set_cu_logger(logger)
+    set_gp_logger(logger)
+    set_rt_logger(logger)
+
+def define_options(parser):
+    define_default_options(parser,
+        ['conf_file', 'server_host', #'simulation',
+         'daemon', 'kill_daemon', 'pidfile'],
+        {'conf_file': {'default_conf_fname': 'dev_conf_mgr.json'},
+         'pidfile': {'default': '/var/run/dev_conf_mgr.pid'}})
+    parser.add_option('-l', '--logging', dest='logging', default=False,
+        help='Logging method. Path to log file or "stdout".')
+    parser.add_option('-v', '--log_level', dest='log_level', default='warning',
+        help='Level of logging. Allowed values "debug", "info", "warning", "error", "critical".')
+    parser.add_option('-p','--platform',dest='platform',default='Device',help='platform where dev_conf_mgr is running, "PC" or "Device" ')
+    parser.add_option('-z','--sim_dev_type',dest='sim_dev_type',default='TacticalRouter',help='device which is to be simulated in PC,"TacticalRouter",ToughVoipDevice,"ToughSDR_HP,ToughSDR_HH" ')
+
+class dev_conf_daemon(Daemon):
+  DAEMON_NAME = 'DevConfMgr Daemon'
+  def __init__(self, conf):
+    Daemon.__init__(self)
+    self.conf = conf
+
+  def run(self):
+
+    conf = self.conf
+    init_logging(conf)
+    platform = conf['platform']
+    logger.debug( "Platform:{}".format(platform))
+    os.umask(022) # workaround, for some reason mask is not right after deamonizing
+    global config
+    config = env_cfg[platform]
+    dev_conf_srv = DevConfManager()
+    #create device_config_folder
+    try:
+      os.makedirs(ROUTING_CONFIGS_PATH,0774)
+    except Exception,ex:
+      pass
+    # copy some of dcm config items to ARS config
+    iftype = dev_conf_srv.dcm_conf['dcm_config']['interface_type']
+    preset_usage = dev_conf_srv.dcm_conf['dcm_config']['presets_used']
+    ep = dev_conf_srv.dcm_conf['dcm_config']['dcm_api_endpoint']
+    config['interface_type'] = iftype
+    config['dcm_api_endpoint'] = ep
+    #set simulated device type (applicable only in PC env)
+    sim_device = conf['sim_dev_type']
+    set_gp_sim_device(sim_device)
+    #create DCM ARS
+    ARS = define_active_req_srv(config,
+        dev_conf_srv, time_step=1, logger=logger_ars, server_name='DevConfManager')
+    srv = ARS(config)
+    dev_conf_srv.set_active_req_server(srv)
+    if iftype =="new_zmq":
+      dev_conf_srv.zmq_context = srv.zmq_context
+      dev_conf_srv.setup_dcm_publisher()
+      set_zmq_context(srv.zmq_context)
+    if preset_usage == True:
+      dev_conf_srv.check_initial_preset_value()
+
+    wait_while_threads_alive_or_kbint()
+    srv.quit()
+
+
+
+def main(options, args, conf):
+
+  daemon = dev_conf_daemon(conf)
+  if conf['kill_daemon']:
+    daemon.startstop(pidfile=conf['pidfile'], action='stop')
+  else:
+    if conf['run_as_daemon']:
+      daemon.startstop( # forks here
+              pidfile=os.path.abspath(conf['pidfile']),
+              action='start')
+    daemon.run()
+
+if __name__ == "__main__":
+  params = program_init_opts_confs(define_options, lambda f: default_conf)
+  main(*params)
