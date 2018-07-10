@@ -30,3 +30,20 @@ atom-text-editor {
 atom-text-editor .cursor {
   // border-color: red;
 }
+
+//####My customs
+// To give more visibility when modals pop up (For OneDark theme)
+atom-panel.modal {
+  @my_bg_opac: 0.4;
+  &:after {
+    opacity: @my_bg_opac;
+    -webkit-animation: overlay-fade 0.24s cubic-bezier(0.215, 0.61, 0.355, 1)
+  }
+  @-webkit-keyframes overlay-fade {
+    0% { opacity: 0; }
+    100% { opacity: @my_bg_opac }
+  }
+}
+
+
+//####My customs END
