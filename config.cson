@@ -3,7 +3,9 @@
     scrollDuration: 1
     scrollRows: 20
   "atom-fuzzy-grep":
+    preserveLastSearch: true
     showFullPath: true
+  "autocomplete-plus": {}
   "bracket-matcher":
     highlightMatchingLineNumber: true
   core:

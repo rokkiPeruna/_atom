@@ -46,3 +46,6 @@
   'alt-down': 'keyboard-scroll:scrollDownWithCursor'
   'ctrl-alt-up': 'keyboard-scroll:scrollUp'
   'ctrl-alt-down': 'keyboard-scroll:scrollDown'
+#Annoyance away, pressing ENTER disables autocomplete for the word
+'atom-text-editor.autocomplete-active':
+  'enter': 'autocomplete-plus:cancel'

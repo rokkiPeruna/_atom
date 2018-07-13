@@ -58,3 +58,9 @@
         $4
         pass
     """
+  'Adds temporary Python note':
+    'prefix': 'tempnote'
+    'body': """
+      #NOTE NOTE NOTE!
+      #$1
+    """
