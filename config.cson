@@ -3,7 +3,6 @@
     scrollDuration: 1
     scrollRows: 20
   "atom-fuzzy-grep":
-    preserveLastSearch: true
     showFullPath: true
   "autocomplete-plus": {}
   "bracket-matcher":
@@ -21,7 +20,7 @@
     userId: "69353531-716e-4c84-ad9a-3f6fa28d88c6"
   "fuzzy-finder": {}
   "keyboard-scroll":
-    animate: true
+    animate: false
     animationDuration: 350
     linesToScrollKeydown: 5
     linesToScrollSingle: 5

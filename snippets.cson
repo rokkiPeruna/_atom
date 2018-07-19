@@ -29,6 +29,14 @@
       # $1
       ######################################################################
     """
+  'Adds info roof':
+    'prefix': 'inforoof'
+    'body': """
+      ######################################################################
+      # $1
+    """
+
+
   'Adds large info header':
     'prefix': 'largeinfoheader'
     'body': """
@@ -63,4 +71,21 @@
     'body': """
       #NOTE NOTE NOTE!
       #$1
+    """
+  'Adds ugly(?) print to get visual info in those logger hells':
+    'prefix': 'uglyprint'
+    'body': """
+      print(\"\"\"\n\n\n
+      UGLYPRINTUGLYPRINTUGLYPRINTUGLYPRINTUGLYPRINT
+      \tUGLYPRINTUGLYPRINTUGLYPRINTUGLYPRINTUGLYPRINT
+      \t\tUGLYPRINTUGLYPRINTUGLYPRINTUGLYPRINTUGLYPRINT
+      \t\t\tUGLYPRINTUGLYPRINTUGLYPRINTUGLYPRINTUGLYPRINT
+      \t\tUGLYPRINTUGLYPRINTUGLYPRINTUGLYPRINTUGLYPRINT
+      \tUGLYPRINTUGLYPRINTUGLYPRINTUGLYPRINTUGLYPRINT
+      UGLYPRINTUGLYPRINTUGLYPRINTUGLYPRINTUGLYPRINT\"\"\"\n\n\n)
+    """
+  'Adds lonely line print':
+    'prefix': 'lonelyline'
+    'body': """
+      print("$1 $1 $1 {} $1 $1 $1".format($2))
     """
