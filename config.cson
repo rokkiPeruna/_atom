@@ -8,13 +8,13 @@
   "bracket-matcher":
     highlightMatchingLineNumber: true
   core:
+    closeDeletedFileTabs: true
     telemetryConsent: "no"
   editor:
     preferredLineLength: 79
     scrollPastEnd: true
     showInvisibles: true
     softWrap: true
-    softWrapAtPreferredLineLength: true
     tabType: "soft"
   "exception-reporting":
     userId: "69353531-716e-4c84-ad9a-3f6fa28d88c6"
